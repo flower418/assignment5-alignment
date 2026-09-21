@@ -21,7 +21,7 @@ def evaluate(name, prompt_path, reward_fn, use_stop):
     sampling_params = {
         "temperature": 1.0,
         "max_tokens": 512,
-        "n": 1,
+        "n": 1, # 每道题生成一个答案
         "seed": 0,
     } 
 
