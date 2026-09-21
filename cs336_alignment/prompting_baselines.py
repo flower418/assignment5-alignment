@@ -15,7 +15,7 @@ vllm_server = vllm_utils.VLLMServer(
     gpu=0,
 )
 
-def evaluate(prompt_path, reward_fn, use_stop):
+def evaluate(name, prompt_path, reward_fn, use_stop):
     template = Path(prompt_path).read_text() # 读取三种 prompt 模板中的一种
     prompts = [template.format(question=row["question"]) for row in rows]
     sampling_params = {
@@ -27,7 +27,7 @@ def evaluate(prompt_path, reward_fn, use_stop):
 
     # r1_zero 的 prompt 需要在 </answer> 处停止
     if use_stop:
-        sampling_params["stop"] = ["</answer>"],
+        sampling_params["stop"] = ["</answer>"]
         sampling_params["include_stop_str_in_output"] = True
 
     completions = vllm_server.generate_completions(
@@ -53,22 +53,38 @@ def evaluate(prompt_path, reward_fn, use_stop):
             category = "unformatted"
         counts[category] += 1
 
+        if category in examples and len(examples[category]) < 10:
+            examples[category].append(completion.text)
+
+    print(f"==={name}===")
+    print("correct:", counts["correct"])
+    print("formatted_but_wrong:", counts["formatted_but_wrong"])
+    print("unformatted:", counts["unformatted"])
+
+    for category, responses in examples.items():
+        print(f"==={category} examples===")
+        for response in responses:
+            print(response)
+
 vllm_server.start()
 
 # question_only 不需要 <think> and <answer>
 evaluate(
+    name="question_only",
     prompt_path="cs336_alignment/prompts/question_only.prompt",
     reward_fn=drgrpo_grader.question_only_reward_fn,
     use_stop=False,
 )
 # zero-shot R1
 evaluate(
+    name="r1_zero",
     prompt_path="cs336_alignment/prompts/r1_zero.prompt",
     reward_fn=drgrpo_grader.r1_zero_reward_fn,
     use_stop = True,
 )
 # few-shot R1
 evaluate(
+    name="r1_zero_three_shot",
     prompt_path="cs336_alignment/prompts/r1_zero_three_shot_gsm8k.prompt",
     reward_fn=drgrpo_grader.r1_zero_reward_fn,
     use_stop=True,
