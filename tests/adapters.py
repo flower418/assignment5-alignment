@@ -46,8 +46,55 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    # 一个 prompt_strs 中有好几个 prompt，对他们分别进行 encode
+    prompt_ids = [
+        tokenizer.encode(prompt, add_special_tokens=False) # 不加 special tokens
+        for prompt in prompt_strs
+    ]
 
+    output_ids = [
+        tokenizer.encode(output, add_special_tokens=False)
+        for output in output_strs
+    ]
+
+    # 把每个样本用 prompt+output 拼接在一起
+    sequences = [
+        prompt + output
+        for prompt, output in zip(prompt_ids, output_ids)
+    ]
+
+    # 找到 sequences 中最长的序列
+    max_length = max(len(sequence) for sequence in sequences)
+
+    # 然后进行 padding，把所有 pair 补全成相同长度
+    padded_sequences = [
+        sequence + [tokenizer.pad_token_id] * (max_length - len(sequence))
+        for sequence in sequences
+    ]
+
+    # 构造 mask，把 prompt 和 padding 部分全 mask 掉
+    response_mask = [
+        [False] * len(prompt) +
+        [True] * len(output) +
+        [False] * (max_length - len(prompt) - len(output))
+        for prompt, output in zip(prompt_ids, output_ids)
+    ]
+
+    # 转成 pytorch tensor
+    full_input_ids = torch.tensor(
+        padded_sequences,
+        dtype=torch.long
+    )
+    full_response_mask = torch.tensor(
+        response_mask,
+        dtype=torch.bool
+    )
+
+    return {
+        "input_ids": full_input_ids[:, :-1], # 不看最后一个
+        "labels": full_input_ids[:, 1:],
+        "response_mask": full_response_mask[:, 1:] # response_mask 必须和 response 对齐
+    }
 
 def run_get_response_log_probs(
     model: torch.nn.Module,
@@ -58,7 +105,6 @@ def run_get_response_log_probs(
     """Get per-token conditional log-probabilities (given the previous tokens)
     from a causal language model, and optionally the entropy of the model's
     next-token distribution.
-
     Args:
         model: PreTrainedModel
             HuggingFace model used for scoring (placed on the correct device
@@ -82,8 +128,23 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    raise NotImplementedError
+    # 根据前缀的 input 生成下面一个 token 的 logit
+    logits = model(input_ids).logits # (batch_size, sequence_length, vocab_size)
+    # 把分数转成 log softmax
+    log_probs = torch.log_softmax(logits, dim=-1)
+    token_log_probs = torch.gather(
+        input=log_probs,
+        dim=-1,
+        index=labels.unsqueeze(-1) # 这里用 unsqueeze 将 labels 转成 3 个维度，方便取每个 token 的 log_prob
+    ).squeeze(-1) # 再变回 2 维，因为维度只有 bsz 和每个 token
+    result = {"log_probs": token_log_probs}
 
+    if return_token_entropy:
+        probs = torch.exp(log_probs) # (bsz, seq_len, vocab_size)
+        entropy = -(probs * log_probs).sum(dim=-1) # (bsz, seq_len)
+        result["token_entropy"] = entropy
+
+    return result
 
 def run_compute_rollout_rewards(
     reward_fn: Callable[[str, str], dict[str, float]],
@@ -114,7 +175,21 @@ def run_compute_rollout_rewards(
                 Reward statistics to log. At minimum, include the mean total
                 and format rewards over the rollout batch.
     """
-    raise NotImplementedError
+    raw_rewards = torch.zeros(len(rollout_responses), dtype=torch.float32)
+    metadata = {
+        "mean_total": 0.0,
+        "mean_format": 0.0
+    }
+
+    for i in range(len(rollout_responses)):
+        rewards = reward_fn(rollout_responses[i], repeated_ground_truths[i])
+        raw_rewards[i] = rewards["reward"]
+        metadata["mean_total"] += rewards["reward"]
+        metadata["mean_format"] += rewards["format_reward"]
+    metadata["mean_total"] /= len(rollout_responses)
+    metadata["mean_format"] /= len(rollout_responses)
+
+    return (raw_rewards, metadata)
 
 
 def run_compute_group_normalized_rewards(
@@ -153,8 +228,27 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    rollout_batch_size = len(raw_rewards)
+    n_prompts_per_rollout_batch = rollout_batch_size // group_size
 
+    advantages = torch.zeros_like(raw_rewards)
+    metadata = {
+        "mean_reward": raw_rewards.mean(),
+        "std_reward": raw_rewards.std(),
+        "mean_advantage": 0.0,
+        "std_advantage": 0.0
+    }
+
+    for i in range(0, rollout_batch_size, group_size):
+        group_rewards = raw_rewards[i: i + group_size]
+        mean = group_rewards.mean()
+        std = group_rewards.std()
+        advantages[i: i + group_size] = (group_rewards - mean) / (std + advantage_eps)
+
+    metadata["mean_advantage"] = advantages.mean()
+    metadata["std_advantage"] = advantages.std()
+
+    return (advantages, metadata)
 
 def run_compute_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
@@ -200,8 +294,10 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    per_token_policy_gradient_loss = -raw_rewards_or_advantages * policy_log_probs
+    metadata = {}
 
+    return (per_token_policy_gradient_loss, metadata)
 
 def run_aggregate_loss_across_microbatch(
     per_token_policy_gradient_loss: torch.Tensor,
@@ -232,8 +328,10 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
-
+    masked_per_token_loss = per_token_policy_gradient_loss * mask # 直接乘 mask 用来 mask
+    loss_per_rollout = masked_per_token_loss.sum(dim=-1) / mask.sum(dim=-1)
+    loss = loss_per_rollout.mean()
+    return loss
 
 def run_grpo_train_step(
     model: torch.nn.Module,
@@ -321,8 +419,89 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+    raw_rewards, reward_metadata = run_compute_rollout_rewards(
+        reward_fn=reward_fn,
+        rollout_responses=rollout_responses,
+        repeated_ground_truths=repeated_ground_truths
+    )
 
+    advantages, advantage_metadata = run_compute_group_normalized_rewards(
+        raw_rewards=raw_rewards,
+        group_size=group_size,
+        advantage_eps=advantage_eps,
+    )
+
+    tokenized = run_tokenize_prompt_and_output(
+        prompt_strs=repeated_prompts,
+        output_strs=rollout_responses,
+        tokenizer=tokenizer
+    )
+
+    device = next(model.parameters()).device
+    input_ids = tokenized["input_ids"].to(device)
+    labels = tokenized["labels"].to(device)
+    response_mask = tokenized["response_mask"].to(device)
+    advantages = advantages.to(device)
+
+    batch_size = len(rollout_responses)
+    total_loss = torch.zeros((), device = device)
+
+    entropy_sum = torch.zeros((), device=device)
+    entropy_token_count = torch.zeros((), device=device)
+
+    # 开始训练
+    optimizer.zero_grad()
+    model.train()
+
+    for i in range(gradient_accumulation_steps):
+        # batch_size 表示总共有 B 个问题，每个问题有 G 个回答，总共就是 batch_size=BG 个 prompt+response
+        # 然后根据 gradient_accumulation_steps，把整个 batch 分为若干份
+        # 每个 microbatch 中的 rollout 数是 batch_size//gradient_accumulation_steps
+        start = i * (batch_size // gradient_accumulation_steps)
+        end = (i + 1) * (batch_size // gradient_accumulation_steps)
+
+        response_output = run_get_response_log_probs(
+            model=model,
+            input_ids=input_ids[start: end],
+            labels=labels[start: end],
+            return_token_entropy=True,
+        )
+        log_probs = response_output["log_probs"]
+
+        token_loss, _ = run_compute_policy_gradient_loss(
+            raw_rewards_or_advantages=advantages[start: end].unsqueeze(-1), # 这里需要 unsqueeze 是为了把 advantage 变成二维的，方便广播
+            policy_log_probs=log_probs,
+        )
+
+        loss = run_aggregate_loss_across_microbatch(
+            per_token_policy_gradient_loss=token_loss,
+            mask=response_mask[start: end]
+        )
+
+        loss = loss * (end - start) / batch_size
+        loss.backward()
+        total_loss += loss.detach()
+
+        mask_mb = response_mask[start: end]
+        entropy_sum += (response_output["token_entropy"] * mask_mb).sum().detach()
+        entropy_token_count += mask_mb.sum()
+
+    metadata = {
+        **reward_metadata,
+        **advantage_metadata
+    }
+    metadata["token_entropy"] = (entropy_sum / entropy_token_count).item() # 计算 rollout_batch 中所有 token 的平均 entropy
+
+    if max_grad_norm is not None:
+        metadata["grad_norm"] = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_grad_norm
+        )
+
+    optimizer.step()
+    optimizer.zero_grad()
+
+    return total_loss, metadata
 
 """
 The below adapters are used in the optional 
